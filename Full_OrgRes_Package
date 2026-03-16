@@ -1,0 +1,23 @@
+```bash
+#!/usr/bin/env bash
+# Organization hierarchy initializer 'Full PI Repository Package (organization + research)'
+# Author: Sara Monteiro, 2026
+
+ROOT="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
+
+mkdir -p "$ROOT"/organization/administrative/resources/{ethics_and_good_practices,data_management,icm_magasin,support}
+mkdir -p "$ROOT"/organization/administrative/planning
+mkdir -p "$ROOT"/organization/administrative/misc/{logos,pictures}
+
+mkdir -p "$ROOT"/organization/education/{tutorials,books,courses}
+
+mkdir -p "$ROOT"/organization/communication/public_engagement
+mkdir -p "$ROOT"/organization/communication/conferences/{presented_posters,presented_talks,conference_debriefings}
+mkdir -p "$ROOT"/organization/communication/{journal_clubs,invited_speakers}
+
+mkdir -p "$ROOT"/organization/meetings/{retreats,project_presentations,rehearsals}
+
+mkdir -p "$ROOT"/organization/ideas/{notes,brainstorming,sources}
+
+echo "Organization hierarchy created at: $ROOT"
+```
