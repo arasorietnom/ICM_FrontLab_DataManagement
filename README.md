@@ -39,7 +39,7 @@
     ├── submissions
     └── literature
 ```
-- ## Project Structure
+- ## Project Structure (vCREATEAM)
 
 ```
 [project_name]/
@@ -102,3 +102,47 @@
     └── atlas
         └── literature
 ```
+
+- ## Organizational Structure
+
+```
+organization/
+│
+├── administrative
+│   ├── resources
+│   │   ├── ethics_and_good_practices
+│   │   ├── data_management
+│   │   ├── icm_magasin
+│   │   └── support
+│   │
+│   ├── planning
+│   │
+│   └── misc
+│       ├── logos
+│       └── pictures
+│
+├── education
+│   ├── tutorials
+│   ├── books
+│   └── courses
+│
+├── communication
+│   ├── public_engagement
+│   ├── conferences
+│   │   ├── presented_posters
+│   │   ├── presented_talks
+│   │   └── conference_debriefings
+│   │
+│   ├── journal_clubs
+│   └── invited_speakers
+│
+├── meetings
+│   ├── retreats
+│   ├── project_presentations
+│   └── rehearsals
+│
+└── ideas
+    ├── notes
+    ├── brainstorming
+    └── sources
+    ```
