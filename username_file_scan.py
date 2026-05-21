@@ -1,9 +1,12 @@
 #!/usr/bin/env python3
 
-
-# terminal commands
-# caffeinate python duplicate_owner_summary.py /network/iss/levy/analyze/volle --per-owner-files
-# python duplicate_owner_summary.py /network/iss/levy/analyze/volle --user Victor.Altmayer --per-owner-files
+# Example terminal commands:
+python duplicate_user_scan.py /path/to/target --per-owner-files
+python duplicate_user_scan.py /path/to/target --user Victor.Altmayer --per-owner-files
+python duplicate_user_scan.py --quarantine-from user_reports/duplicate_report_Victor.Altmayer_YYYYMMDD_HHMMSS.csv
+# caffeinate python duplicate_user_scan.py /path/to/target --per-owner-files
+# python duplicate_user_scan.py /path/to/target --user Victor.Altmayer --per-owner-files
+# python duplicate_user_scan.py --quarantine-from user_reports/duplicate_report_all_users_YYYYMMDD_HHMMSS.csv
 
 import argparse
 import csv
@@ -24,6 +27,7 @@ except ImportError:
 
 
 DEFAULT_OUTPUT_DIRNAME = "user_reports"
+DEFAULT_QUARANTINE_DIRNAME = "quarantined_duplicates"
 
 EXCLUDED_NAMES = {
     ".git", ".venv", "venv", "env", "__pycache__", ".cache",
@@ -66,6 +70,14 @@ def bytes_to_human(num_bytes: float) -> str:
         size /= 1024
 
 
+def bytes_to_mb(num_bytes: float) -> float:
+    return round(float(num_bytes) / (1024 ** 2), 3)
+
+
+def bytes_to_gb(num_bytes: float) -> float:
+    return round(float(num_bytes) / (1024 ** 3), 3)
+
+
 def resolve_hash_algorithm(algorithm: str) -> str:
     if algorithm == "auto":
         if blake3 is not None:
@@ -93,14 +105,6 @@ def compute_hash(path: Path, algorithm: str) -> str:
             h.update(chunk)
 
     return h.hexdigest()
-
-
-def get_owner_username(path: Path) -> str:
-    stat = path.stat()
-    try:
-        return pwd.getpwuid(stat.st_uid).pw_name
-    except Exception:
-        return str(stat.st_uid)
 
 
 def get_file_metadata(path: Path) -> dict:
@@ -260,10 +264,41 @@ def choose_keep_file(paths):
     return sorted(paths, key=lambda p: (-p.stat().st_mtime, len(str(p))))[0]
 
 
-def safe_quarantine_path(root: Path, original: Path, group_id: int) -> Path:
-    quarantine_root = root / "quarantined_duplicates"
-    relative = original.relative_to(root)
+def safe_quarantine_path(quarantine_root: Path, scan_root: Path, original: Path, group_id: int) -> Path:
+    """
+    Quarantine destination is always under the launch directory, not under the scanned root.
+
+    Example if launched from /my/workdir:
+        /my/workdir/quarantined_duplicates/group_00001/<relative_original_path>
+    """
+    try:
+        relative = original.relative_to(scan_root)
+    except Exception:
+        # For safety when scan_root is unavailable or unrelated, preserve a sanitized absolute path.
+        relative = Path(*[safe_name(part) for part in original.parts if part not in ("/", "")])
+
     target = quarantine_root / f"group_{group_id:05d}" / relative
+
+    counter = 1
+    final_target = target
+
+    while final_target.exists():
+        final_target = target.with_name(
+            f"{target.stem}__duplicate_{counter}{target.suffix}"
+        )
+        counter += 1
+
+    return final_target
+
+
+def safe_quarantine_path_from_csv(quarantine_root: Path, src: Path, group_id: str) -> Path:
+    """
+    Recompute quarantine destination from a saved duplicate report CSV.
+    This avoids relying on old report paths that may point inside the scanned root.
+    """
+    safe_group = safe_name(str(group_id or "unknown"))
+    sanitized_parts = [safe_name(part) for part in src.parts if part not in ("/", "")]
+    target = quarantine_root / f"group_{safe_group}" / Path(*sanitized_parts)
 
     counter = 1
     final_target = target
@@ -292,13 +327,26 @@ def write_csv(rows, output_csv: Path):
         writer.writerows(rows)
 
 
-def scan_duplicates(root: Path, algorithm: str, max_mb: float, skip_symlinks: bool, requested_users):
+def read_csv_rows(csv_path: Path):
+    with csv_path.open("r", newline="", encoding="utf-8") as f:
+        return list(csv.DictReader(f))
+
+
+def scan_duplicates(
+    root: Path,
+    algorithm: str,
+    max_mb: float,
+    skip_symlinks: bool,
+    requested_users,
+    quarantine_root: Path,
+):
     resolved_algorithm = resolve_hash_algorithm(algorithm)
 
     print(f"Scanning root: {root}")
     print("Mode: read-only scan first")
-    print("No files will be moved unless you confirm quarantine later.")
+    print("No files will be moved unless you run quarantine mode.")
     print(f"Hash algorithm: {resolved_algorithm.upper()}")
+    print(f"Quarantine destination if triggered later: {quarantine_root}")
 
     files, collection_stats = collect_files(
         root=root,
@@ -415,7 +463,7 @@ def scan_duplicates(root: Path, algorithm: str, max_mb: float, skip_symlinks: bo
                 continue
 
             quarantine = path != keep_file
-            quarantine_target = safe_quarantine_path(root, path, group_id) if quarantine else ""
+            quarantine_target = safe_quarantine_path(quarantine_root, root, path, group_id) if quarantine else ""
 
             duplicate_rows.append({
                 "duplicate_group_id": group_id,
@@ -431,7 +479,8 @@ def scan_duplicates(root: Path, algorithm: str, max_mb: float, skip_symlinks: bo
                 "hash_algorithm": resolved_algorithm.upper(),
                 "content_hash": digest,
                 "size_bytes": stat.st_size,
-                "size_mb": round(stat.st_size / (1024 ** 2), 3),
+                "size_mb": bytes_to_mb(stat.st_size),
+                "size_gb": bytes_to_gb(stat.st_size),
                 "reason": f"same {resolved_algorithm.upper()} content hash",
             })
 
@@ -486,8 +535,8 @@ def summarize_by_owner(rows):
     summary_rows = []
 
     for owner, stats in owner_stats.items():
-        duplicate_capacity = stats["duplicate_capacity_bytes_all"]
-        quarantine_capacity = stats["quarantine_capacity_bytes"]
+        duplicate_bytes = stats["duplicate_capacity_bytes_all"]
+        quarantine_bytes = stats["quarantine_capacity_bytes"]
 
         summary_rows.append({
             "owner_username": owner,
@@ -495,25 +544,40 @@ def summarize_by_owner(rows):
             "duplicate_rows_all": stats["duplicate_rows_all"],
             "keep_rows": stats["keep_rows"],
             "quarantine_candidates": stats["quarantine_candidates"],
-            "duplicate_capacity_bytes_all": duplicate_capacity,
-            "duplicate_capacity_human_all": bytes_to_human(duplicate_capacity),
+
+            "duplicate_capacity_bytes_all": duplicate_bytes,
+            "duplicate_capacity_mb_all": bytes_to_mb(duplicate_bytes),
+            "duplicate_capacity_gb_all": bytes_to_gb(duplicate_bytes),
+            "duplicate_capacity_human_all": bytes_to_human(duplicate_bytes),
             "duplicate_capacity_percent_all": round(
-                duplicate_capacity / total_duplicate_capacity * 100, 2
+                duplicate_bytes / total_duplicate_capacity * 100, 2
             ) if total_duplicate_capacity else 0,
-            "quarantine_capacity_bytes": quarantine_capacity,
-            "quarantine_capacity_human": bytes_to_human(quarantine_capacity),
+
+            "quarantine_capacity_bytes": quarantine_bytes,
+            "quarantine_capacity_mb": bytes_to_mb(quarantine_bytes),
+            "quarantine_capacity_gb": bytes_to_gb(quarantine_bytes),
+            "quarantine_capacity_human": bytes_to_human(quarantine_bytes),
             "quarantine_capacity_percent": round(
-                quarantine_capacity / total_quarantine_capacity * 100, 2
+                quarantine_bytes / total_quarantine_capacity * 100, 2
             ) if total_quarantine_capacity else 0,
         })
 
-    summary_rows.sort(key=lambda r: r["duplicate_capacity_bytes_all"], reverse=True)
+    # Main cleanup priority: highest reclaimable/quarantine capacity first.
+    summary_rows.sort(key=lambda r: r["quarantine_capacity_gb"], reverse=True)
 
     totals = {
         "total_duplicate_capacity": total_duplicate_capacity,
+        "total_duplicate_capacity_mb": bytes_to_mb(total_duplicate_capacity),
+        "total_duplicate_capacity_gb": bytes_to_gb(total_duplicate_capacity),
+
         "total_quarantine_capacity": total_quarantine_capacity,
+        "total_quarantine_capacity_mb": bytes_to_mb(total_quarantine_capacity),
+        "total_quarantine_capacity_gb": bytes_to_gb(total_quarantine_capacity),
+
         "total_duplicate_rows": len(rows),
-        "total_quarantine_rows": sum(1 for r in rows if r.get("recommended_action") == "QUARANTINE"),
+        "total_quarantine_rows": sum(
+            1 for r in rows if r.get("recommended_action") == "QUARANTINE"
+        ),
     }
 
     return summary_rows, totals
@@ -525,27 +589,37 @@ def write_text_report(summary_rows, totals, output_txt: Path, top_n: int):
     lines = []
     date = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
-    lines.append("=" * 100)
+    lines.append("=" * 110)
     lines.append("Duplicate file analysis by owner")
     lines.append(f"Date of report: {date}")
-    lines.append("=" * 100)
+    lines.append("=" * 110)
     lines.append("")
     lines.append(f"Total duplicate rows: {totals['total_duplicate_rows']:,}")
     lines.append(f"Total duplicate capacity: {bytes_to_human(totals['total_duplicate_capacity'])}")
+    lines.append(f"Total duplicate capacity MB: {totals['total_duplicate_capacity_mb']:,.3f} MB")
+    lines.append(f"Total duplicate capacity GB: {totals['total_duplicate_capacity_gb']:,.3f} GB")
+    lines.append("")
     lines.append(f"Total quarantine candidates: {totals['total_quarantine_rows']:,}")
     lines.append(f"Potential reclaimable capacity: {bytes_to_human(totals['total_quarantine_capacity'])}")
+    lines.append(f"Potential reclaimable capacity MB: {totals['total_quarantine_capacity_mb']:,.3f} MB")
+    lines.append(f"Potential reclaimable capacity GB: {totals['total_quarantine_capacity_gb']:,.3f} GB")
     lines.append("")
-    lines.append("=" * 100)
+    lines.append("=" * 110)
     lines.append(f"Capacity of duplicate files by owner, top {top_n}")
-    lines.append("=" * 100)
+    lines.append("Sorted descending by reclaimable/quarantine GB")
+    lines.append("=" * 110)
     lines.append("")
-    lines.append(f"{'Capacity':>14} {'%':>8} {'Groups':>8} {'Rows':>10} {'Quarantine':>12}  Owner")
-    lines.append("-" * 100)
+    lines.append(
+        f"{'Dup GB':>12} {'Quarantine GB':>16} {'Q %':>8} "
+        f"{'Groups':>8} {'Rows':>10} {'Quarantine':>12}  Owner"
+    )
+    lines.append("-" * 110)
 
     for row in summary_rows[:top_n]:
         lines.append(
-            f"{row['duplicate_capacity_human_all']:>14} "
-            f"{row['duplicate_capacity_percent_all']:>7.1f}% "
+            f"{row['duplicate_capacity_gb_all']:>12,.2f} "
+            f"{row['quarantine_capacity_gb']:>16,.2f} "
+            f"{row['quarantine_capacity_percent']:>7.1f}% "
             f"{row['duplicate_groups']:>8,} "
             f"{row['duplicate_rows_all']:>10,} "
             f"{row['quarantine_candidates']:>12,}  "
@@ -570,20 +644,27 @@ def write_per_owner_files(rows, output_dir: Path):
         write_csv(owner_rows, out_file)
 
 
-def quarantine_files(rows, manifest_csv: Path):
-    move_rows = [row for row in rows if row["recommended_action"] == "QUARANTINE"]
+def quarantine_files_from_rows(rows, manifest_csv: Path, quarantine_root: Path, recompute_targets: bool):
+    move_rows = [row for row in rows if row.get("recommended_action") == "QUARANTINE"]
 
     if not move_rows:
         print("No quarantine candidates found.")
         return
 
+    quarantine_root.mkdir(parents=True, exist_ok=True)
+
+    total_bytes = sum(int(float(row.get("size_bytes", 0) or 0)) for row in move_rows)
+
     print()
     print("Quarantine information:")
     print("Files will be MOVED, not deleted.")
+    print(f"Quarantine root: {quarantine_root}")
+    print(f"Files to move: {len(move_rows):,}")
+    print(f"Potential capacity moved: {bytes_to_human(total_bytes)} ({bytes_to_gb(total_bytes):,.3f} GB)")
     print("A manifest CSV will be written so the operation can be reviewed or manually reversed.")
     print()
 
-    answer = input(f"Move {len(move_rows)} files to quarantined_duplicates? Type y or n: ").strip().lower()
+    answer = input(f"Move {len(move_rows):,} files to quarantine? Type y or n: ").strip().lower()
 
     if answer != "y":
         print("Quarantine cancelled. No files were moved.")
@@ -593,15 +674,33 @@ def quarantine_files(rows, manifest_csv: Path):
 
     for row in move_rows:
         src = Path(row["candidate_file"])
-        dst = Path(row["quarantine_target"])
+
+        if recompute_targets:
+            dst = safe_quarantine_path_from_csv(
+                quarantine_root=quarantine_root,
+                src=src,
+                group_id=row.get("duplicate_group_id", "unknown"),
+            )
+        else:
+            dst = Path(row.get("quarantine_target") or "")
+            if not str(dst):
+                dst = safe_quarantine_path_from_csv(
+                    quarantine_root=quarantine_root,
+                    src=src,
+                    group_id=row.get("duplicate_group_id", "unknown"),
+                )
 
         try:
+            if not src.exists():
+                raise FileNotFoundError(f"Source file no longer exists: {src}")
+
             dst.parent.mkdir(parents=True, exist_ok=True)
             shutil.move(str(src), str(dst))
 
             manifest.append({
                 **row,
                 "quarantine_status": "MOVED",
+                "actual_quarantine_target": str(dst),
                 "moved_at": datetime.now().isoformat(timespec="seconds"),
             })
 
@@ -611,6 +710,7 @@ def quarantine_files(rows, manifest_csv: Path):
             manifest.append({
                 **row,
                 "quarantine_status": f"FAILED: {e}",
+                "actual_quarantine_target": str(dst),
                 "moved_at": datetime.now().isoformat(timespec="seconds"),
             })
 
@@ -622,12 +722,20 @@ def quarantine_files(rows, manifest_csv: Path):
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Full duplicate scan with owner-level reporting."
+        description="Full duplicate scan with owner-level reporting and CSV-based quarantine."
     )
 
     parser.add_argument(
         "path",
-        help="Target directory to scan."
+        nargs="?",
+        default=None,
+        help="Target directory to scan. Not required when using --quarantine-from."
+    )
+
+    parser.add_argument(
+        "--quarantine-from",
+        default=None,
+        help="Move QUARANTINE rows from an existing duplicate_report CSV without rescanning."
     )
 
     parser.add_argument(
@@ -641,6 +749,12 @@ def main():
         "--out-dir",
         default=None,
         help="Output directory. Default: ./user_reports"
+    )
+
+    parser.add_argument(
+        "--quarantine-dir",
+        default=None,
+        help="Quarantine directory. Default: ./quarantined_duplicates"
     )
 
     parser.add_argument(
@@ -672,7 +786,13 @@ def main():
     parser.add_argument(
         "--quarantine",
         action="store_true",
-        help="Ask whether to move recommended duplicates."
+        help="After scanning, ask whether to move recommended duplicates."
+    )
+
+    parser.add_argument(
+        "--use-report-quarantine-targets",
+        action="store_true",
+        help="For --quarantine-from, use quarantine_target values from the CSV instead of recomputing under ./quarantined_duplicates."
     )
 
     parser.add_argument(
@@ -684,18 +804,39 @@ def main():
 
     args = parser.parse_args()
 
+    output_dir = Path(args.out_dir).expanduser().resolve() if args.out_dir else Path.cwd() / DEFAULT_OUTPUT_DIRNAME
+    quarantine_root = Path(args.quarantine_dir).expanduser().resolve() if args.quarantine_dir else Path.cwd() / DEFAULT_QUARANTINE_DIRNAME
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+
+    if args.quarantine_from:
+        report_csv = Path(args.quarantine_from).expanduser().resolve()
+
+        if not report_csv.exists() or not report_csv.is_file():
+            print(f"Invalid quarantine report CSV: {report_csv}", file=sys.stderr)
+            sys.exit(1)
+
+        rows = read_csv_rows(report_csv)
+        manifest_csv = output_dir / f"quarantine_manifest_from_csv_{timestamp}.csv"
+
+        quarantine_files_from_rows(
+            rows=rows,
+            manifest_csv=manifest_csv,
+            quarantine_root=quarantine_root,
+            recompute_targets=not args.use_report_quarantine_targets,
+        )
+        return
+
+    if not args.path:
+        print("Error: a target scan directory is required unless using --quarantine-from.", file=sys.stderr)
+        sys.exit(2)
+
     root = Path(args.path).expanduser().resolve()
 
     if not root.exists() or not root.is_dir():
         print(f"Invalid scan path: {root}", file=sys.stderr)
         sys.exit(1)
-
-    if args.out_dir is None:
-        output_dir = Path.cwd() / DEFAULT_OUTPUT_DIRNAME
-    else:
-        output_dir = Path(args.out_dir).expanduser().resolve()
-
-    output_dir.mkdir(parents=True, exist_ok=True)
 
     requested_users = None
     user_suffix = "all_users"
@@ -703,8 +844,6 @@ def main():
     if args.user:
         requested_users = {u.lower() for u in args.user}
         user_suffix = "_".join(safe_name(u) for u in args.user)
-
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
 
     duplicate_report_csv = output_dir / f"duplicate_report_{user_suffix}_{timestamp}.csv"
     owner_summary_csv = output_dir / f"duplicate_capacity_by_owner_{user_suffix}_{timestamp}.csv"
@@ -717,6 +856,7 @@ def main():
         max_mb=args.max_mb,
         skip_symlinks=not args.follow_symlinks,
         requested_users=requested_users,
+        quarantine_root=quarantine_root,
     )
 
     write_csv(duplicate_rows, duplicate_report_csv)
@@ -744,20 +884,29 @@ def main():
     print(f"Duplicate groups found: {groups:,}")
     print(f"Duplicate files found: {diagnostics['live_duplicate_files']:,}")
     print(f"Files recommended for quarantine: {quarantine_count:,}")
+    print(f"Total duplicate capacity: {bytes_to_human(totals['total_duplicate_capacity'])} ({totals['total_duplicate_capacity_gb']:,.3f} GB)")
+    print(f"Potential reclaimable capacity: {bytes_to_human(totals['total_quarantine_capacity'])} ({totals['total_quarantine_capacity_gb']:,.3f} GB)")
     print()
     print(f"Full duplicate report: {duplicate_report_csv}")
     print(f"Owner summary CSV: {owner_summary_csv}")
     print(f"Owner summary TXT: {owner_summary_txt}")
+    print(f"Quarantine directory: {quarantine_root}")
 
     if args.per_owner_files:
         print(f"Per-owner reports: {output_dir / 'per_owner'}")
 
     if args.quarantine:
-        quarantine_files(duplicate_rows, manifest_csv)
+        quarantine_files_from_rows(
+            rows=duplicate_rows,
+            manifest_csv=manifest_csv,
+            quarantine_root=quarantine_root,
+            recompute_targets=False,
+        )
     else:
         print()
         print("No files were moved.")
-        print("To enable interactive quarantine, rerun with: --quarantine")
+        print("To quarantine later without rescanning, run:")
+        print(f"python {Path(sys.argv[0]).name} --quarantine-from {duplicate_report_csv}")
 
 
 if __name__ == "__main__":
