@@ -2,8 +2,8 @@
 
 
 # terminal commands
-# python duplicate_user_scan.py /network/iss/levy/analyze/vol1e --per-owner-files
-# python duplicate_user_scan.py /network/iss/levy/analyze/vol1e --user [insert user handle] --per-owner-files
+# python duplicate_user_scan.py [file path] --per-owner-files
+# python duplicate_user_scan.py [file path] [user handle] --per-owner-files
 
 import argparse
 import csv
