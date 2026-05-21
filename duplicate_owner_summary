@@ -1,0 +1,249 @@
+#!/usr/bin/env python3
+
+import argparse
+import csv
+from collections import defaultdict
+from datetime import datetime
+from pathlib import Path
+
+
+def bytes_to_human(num_bytes: float) -> str:
+    units = ["B", "KB", "MB", "GB", "TB", "PB"]
+    size = float(num_bytes)
+
+    for unit in units:
+        if size < 1024 or unit == units[-1]:
+            return f"{size:.2f} {unit}"
+        size /= 1024
+
+
+def read_duplicate_report(csv_path: Path):
+    with csv_path.open("r", newline="", encoding="utf-8") as f:
+        reader = csv.DictReader(f)
+        return list(reader)
+
+
+def summarize_by_owner(rows):
+    owner_stats = defaultdict(lambda: {
+        "duplicate_rows": 0,
+        "quarantine_candidates": 0,
+        "keep_rows": 0,
+        "duplicate_capacity_bytes": 0,
+        "quarantine_capacity_bytes": 0,
+        "groups": set(),
+    })
+
+    total_duplicate_rows = 0
+    total_duplicate_capacity = 0
+    total_quarantine_rows = 0
+    total_quarantine_capacity = 0
+
+    for row in rows:
+        owner = row.get("owner_username") or "UNKNOWN"
+        action = row.get("recommended_action", "")
+        group_id = row.get("duplicate_group_id", "")
+        size = int(float(row.get("size_bytes", 0) or 0))
+
+        owner_stats[owner]["duplicate_rows"] += 1
+        owner_stats[owner]["duplicate_capacity_bytes"] += size
+        owner_stats[owner]["groups"].add(group_id)
+
+        total_duplicate_rows += 1
+        total_duplicate_capacity += size
+
+        if action == "QUARANTINE":
+            owner_stats[owner]["quarantine_candidates"] += 1
+            owner_stats[owner]["quarantine_capacity_bytes"] += size
+            total_quarantine_rows += 1
+            total_quarantine_capacity += size
+
+        elif action == "KEEP":
+            owner_stats[owner]["keep_rows"] += 1
+
+    return owner_stats, {
+        "total_duplicate_rows": total_duplicate_rows,
+        "total_duplicate_capacity": total_duplicate_capacity,
+        "total_quarantine_rows": total_quarantine_rows,
+        "total_quarantine_capacity": total_quarantine_capacity,
+    }
+
+
+def write_owner_summary(owner_stats, totals, output_csv: Path):
+    output_csv.parent.mkdir(parents=True, exist_ok=True)
+
+    rows = []
+
+    for owner, stats in owner_stats.items():
+        duplicate_capacity = stats["duplicate_capacity_bytes"]
+        quarantine_capacity = stats["quarantine_capacity_bytes"]
+
+        duplicate_pct = (
+            duplicate_capacity / totals["total_duplicate_capacity"] * 100
+            if totals["total_duplicate_capacity"] else 0
+        )
+
+        quarantine_pct = (
+            quarantine_capacity / totals["total_quarantine_capacity"] * 100
+            if totals["total_quarantine_capacity"] else 0
+        )
+
+        rows.append({
+            "owner_username": owner,
+            "duplicate_groups": len(stats["groups"]),
+            "duplicate_rows_all": stats["duplicate_rows"],
+            "keep_rows": stats["keep_rows"],
+            "quarantine_candidates": stats["quarantine_candidates"],
+            "duplicate_capacity_bytes_all": duplicate_capacity,
+            "duplicate_capacity_human_all": bytes_to_human(duplicate_capacity),
+            "duplicate_capacity_percent_all": round(duplicate_pct, 2),
+            "quarantine_capacity_bytes": quarantine_capacity,
+            "quarantine_capacity_human": bytes_to_human(quarantine_capacity),
+            "quarantine_capacity_percent": round(quarantine_pct, 2),
+        })
+
+    rows.sort(key=lambda r: r["duplicate_capacity_bytes_all"], reverse=True)
+
+    fieldnames = list(rows[0].keys()) if rows else [
+        "owner_username",
+        "duplicate_groups",
+        "duplicate_rows_all",
+        "keep_rows",
+        "quarantine_candidates",
+        "duplicate_capacity_bytes_all",
+        "duplicate_capacity_human_all",
+        "duplicate_capacity_percent_all",
+        "quarantine_capacity_bytes",
+        "quarantine_capacity_human",
+        "quarantine_capacity_percent",
+    ]
+
+    with output_csv.open("w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows(rows)
+
+    return rows
+
+
+def write_per_owner_files(rows, output_dir: Path):
+    per_owner_dir = output_dir / "per_owner"
+    per_owner_dir.mkdir(parents=True, exist_ok=True)
+
+    grouped = defaultdict(list)
+
+    for row in rows:
+        owner = row.get("owner_username") or "UNKNOWN"
+        grouped[owner].append(row)
+
+    for owner, owner_rows in grouped.items():
+        safe_owner = "".join(c if c.isalnum() or c in "._-" else "_" for c in owner)
+        out_file = per_owner_dir / f"duplicates_{safe_owner}.csv"
+
+        with out_file.open("w", newline="", encoding="utf-8") as f:
+            writer = csv.DictWriter(f, fieldnames=owner_rows[0].keys())
+            writer.writeheader()
+            writer.writerows(owner_rows)
+
+
+def write_text_report(summary_rows, totals, output_txt: Path, top_n: int):
+    output_txt.parent.mkdir(parents=True, exist_ok=True)
+
+    lines = []
+    date = datetime.now().strftime("%Y-%m-%d")
+
+    lines.append("=" * 90)
+    lines.append("Duplicate file analysis by owner")
+    lines.append(f"Date of report: {date}")
+    lines.append("=" * 90)
+    lines.append("")
+    lines.append(f"Total duplicate rows: {totals['total_duplicate_rows']:,}")
+    lines.append(f"Total duplicate capacity: {bytes_to_human(totals['total_duplicate_capacity'])}")
+    lines.append(f"Total quarantine candidates: {totals['total_quarantine_rows']:,}")
+    lines.append(f"Potential reclaimable capacity: {bytes_to_human(totals['total_quarantine_capacity'])}")
+    lines.append("")
+    lines.append("=" * 90)
+    lines.append(f"Capacity of duplicate files by owner, top {top_n}")
+    lines.append("=" * 90)
+    lines.append("")
+    lines.append(f"{'Capacity':>14} {'%':>8} {'Groups':>8} {'Rows':>10} {'Quarantine':>12}  Owner")
+    lines.append("-" * 90)
+
+    for row in summary_rows[:top_n]:
+        lines.append(
+            f"{row['duplicate_capacity_human_all']:>14} "
+            f"{row['duplicate_capacity_percent_all']:>7.1f}% "
+            f"{row['duplicate_groups']:>8,} "
+            f"{row['duplicate_rows_all']:>10,} "
+            f"{row['quarantine_candidates']:>12,}  "
+            f"{row['owner_username']}"
+        )
+
+    output_txt.write_text("\n".join(lines), encoding="utf-8")
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Summarize duplicate scanner output by file owner."
+    )
+
+    parser.add_argument(
+        "duplicate_report",
+        help="Path to duplicate_report CSV generated by duplicate_scan.py"
+    )
+
+    parser.add_argument(
+        "--out-dir",
+        default="reports/owner_duplicate_analysis",
+        help="Output directory for owner summaries"
+    )
+
+    parser.add_argument(
+        "--top-n",
+        type=int,
+        default=15,
+        help="Number of owners to show in text report"
+    )
+
+    parser.add_argument(
+        "--per-owner-files",
+        action="store_true",
+        help="Write one CSV file per owner"
+    )
+
+    args = parser.parse_args()
+
+    input_csv = Path(args.duplicate_report).expanduser().resolve()
+    output_dir = Path(args.out_dir).expanduser().resolve()
+
+    if not input_csv.exists():
+        raise FileNotFoundError(f"Input CSV does not exist: {input_csv}")
+
+    rows = read_duplicate_report(input_csv)
+
+    if not rows:
+        print("Input duplicate report is empty. Nothing to summarize.")
+        return
+
+    owner_stats, totals = summarize_by_owner(rows)
+
+    summary_csv = output_dir / "duplicate_capacity_by_owner.csv"
+    summary_txt = output_dir / "duplicate_capacity_by_owner.txt"
+
+    summary_rows = write_owner_summary(owner_stats, totals, summary_csv)
+    write_text_report(summary_rows, totals, summary_txt, args.top_n)
+
+    if args.per_owner_files:
+        write_per_owner_files(rows, output_dir)
+
+    print()
+    print("Owner duplicate analysis complete.")
+    print(f"Owners detected: {len(owner_stats):,}")
+    print(f"Summary CSV: {summary_csv}")
+    print(f"Text report: {summary_txt}")
+
+    if args.per_owner_files:
+        print(f"Per-owner CSV files: {output_dir / 'per_owner'}")
+
+
+if __name__ == "__main__":
+    main()
