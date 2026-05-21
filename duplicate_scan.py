@@ -18,7 +18,7 @@ except ImportError:
     blake3 = None
 
 
-DEFAULT_REPORT_DIR = Path("/network/iss/levy/analyze/vol1e/sara/reports")
+DEFAULT_REPORT_DIRNAME = "reports"
 
 EXCLUDED_NAMES = {
     ".git", ".venv", "venv", "env", "__pycache__", ".cache",
@@ -35,6 +35,11 @@ def progress_bar(current: int, total: int, width: int = 30) -> str:
     filled = int(width * ratio)
     bar = "█" * filled + "-" * (width - filled)
     return f"[{bar}] {ratio * 100:5.1f}%"
+
+
+def activity_bar(count: int, width: int = 20) -> str:
+    filled = (count // 100) % (width + 1)
+    return "[" + "█" * filled + "-" * (width - filled) + "]"
 
 
 def shorten_path(path: Path, max_len: int = 100) -> str:
@@ -115,10 +120,13 @@ def collect_files(root: Path, max_mb: float, skip_symlinks: bool):
     dirs_scanned = 0
     files_seen = 0
     last_print = time.time()
+    spinner = ["|", "/", "-", "\\"]
+    spin_idx = 0
 
     print()
     print("Collecting files...")
     print(f"Maximum file size included: {max_mb:,.0f} MB")
+    print("Discovery progress is activity-based because total file count is unknown at this stage.")
     print()
 
     for dirpath, dirnames, filenames in os.walk(root):
@@ -163,14 +171,18 @@ def collect_files(root: Path, max_mb: float, skip_symlinks: bool):
                 skipped_unreadable += 1
                 continue
 
-        if time.time() - last_print >= 5:
+        if time.time() - last_print >= 1:
+            symbol = spinner[spin_idx % len(spinner)]
+            spin_idx += 1
+
             print(
-                f"\rScanning directory: {shorten_path(current)} | "
+                f"\r{symbol} Discovering {activity_bar(dirs_scanned)} | "
+                f"directory: {shorten_path(current, 70)} | "
                 f"dirs: {dirs_scanned:,} | "
-                f"files seen: {files_seen:,} | "
-                f"files kept: {len(files):,} | "
-                f"skipped large: {skipped_large:,} | "
-                f"permission denied: {skipped_permission:,} | "
+                f"seen: {files_seen:,} | "
+                f"kept: {len(files):,} | "
+                f"large: {skipped_large:,} | "
+                f"perm: {skipped_permission:,} | "
                 f"unreadable: {skipped_unreadable:,}",
                 end="",
                 flush=True
@@ -325,12 +337,12 @@ def scan_duplicates(root: Path, algorithm: str, max_mb: float, skip_symlinks: bo
                 print()
                 print(f"Skipped unreadable/hash-failed file: {path} ({e})", flush=True)
 
-            if time.time() - last_print >= 5:
+            if time.time() - last_print >= 1:
                 bar = progress_bar(hashed_files, total_candidate_files)
 
                 print(
                     f"\rHashing {bar} | "
-                    f"current: {shorten_path(path)} | "
+                    f"current: {shorten_path(path, 70)} | "
                     f"size-groups: {group_idx:,}/{len(candidate_groups):,} | "
                     f"files: {hashed_files:,}/{total_candidate_files:,} | "
                     f"duplicate groups: {live_duplicate_groups:,} | "
@@ -469,7 +481,7 @@ def main():
     parser.add_argument(
         "--out",
         default=None,
-        help="CSV report output path. Default: timestamped report in /network/iss/levy/analyze/vol1e/sara/reports"
+        help="CSV report output path. Default: timestamped report in ./reports"
     )
 
     parser.add_argument(
@@ -501,7 +513,7 @@ def main():
     parser.add_argument(
         "--manifest",
         default=None,
-        help="CSV manifest for quarantined files. Default: timestamped manifest in reports folder."
+        help="CSV manifest for quarantined files. Default: timestamped manifest in ./reports."
     )
 
     args = parser.parse_args()
@@ -512,16 +524,18 @@ def main():
         print(f"Invalid path: {root}", file=sys.stderr)
         sys.exit(1)
 
-    DEFAULT_REPORT_DIR.mkdir(parents=True, exist_ok=True)
+    default_report_dir = Path.cwd() / DEFAULT_REPORT_DIRNAME
+    default_report_dir.mkdir(parents=True, exist_ok=True)
+
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
 
     if args.out is None:
-        output_csv = DEFAULT_REPORT_DIR / f"duplicate_report_{timestamp}.csv"
+        output_csv = default_report_dir / f"duplicate_report_{timestamp}.csv"
     else:
         output_csv = Path(args.out).expanduser().resolve()
 
     if args.manifest is None:
-        manifest_csv = DEFAULT_REPORT_DIR / f"quarantine_manifest_{timestamp}.csv"
+        manifest_csv = default_report_dir / f"quarantine_manifest_{timestamp}.csv"
     else:
         manifest_csv = Path(args.manifest).expanduser().resolve()
 
