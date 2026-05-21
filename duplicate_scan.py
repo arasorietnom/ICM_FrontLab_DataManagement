@@ -6,6 +6,7 @@ import hashlib
 import os
 import shutil
 import sys
+import time
 from collections import defaultdict
 from datetime import datetime
 from pathlib import Path
@@ -23,10 +24,22 @@ EXCLUDED_NAMES = {
 }
 
 
+def resolve_hash_algorithm(algorithm: str) -> str:
+    if algorithm == "auto":
+        if blake3 is not None:
+            return "blake3"
+        print("BLAKE3 not installed. Falling back to SHA256.", flush=True)
+        return "sha256"
+
+    if algorithm == "blake3" and blake3 is None:
+        print("WARNING: BLAKE3 requested but not installed. Falling back to SHA256.", flush=True)
+        return "sha256"
+
+    return algorithm
+
+
 def compute_hash(path: Path, algorithm: str) -> str:
     if algorithm == "blake3":
-        if blake3 is None:
-            raise RuntimeError("BLAKE3 not installed. Use --hash sha256 or install blake3.")
         h = blake3.blake3()
     elif algorithm == "sha256":
         h = hashlib.sha256()
@@ -54,9 +67,26 @@ def should_skip(path: Path, root: Path, skip_symlinks: bool) -> bool:
 
 def collect_files(root: Path, max_mb: float, skip_symlinks: bool):
     max_bytes = int(max_mb * 1024 * 1024)
+
     files = []
+    skipped_empty = 0
+    skipped_large = 0
+    skipped_symlink_or_excluded = 0
+    skipped_unreadable = 0
+
+    dirs_scanned = 0
+    files_seen = 0
+    last_print = time.time()
+
+    print()
+    print("Collecting files...")
+    print(f"Maximum file size included: {max_mb:,.0f} MB")
+    print()
 
     for dirpath, dirnames, filenames in os.walk(root):
+        dirs_scanned += 1
+        files_seen += len(filenames)
+
         current = Path(dirpath)
 
         dirnames[:] = [
@@ -69,6 +99,7 @@ def collect_files(root: Path, max_mb: float, skip_symlinks: bool):
 
             try:
                 if should_skip(path, root, skip_symlinks):
+                    skipped_symlink_or_excluded += 1
                     continue
 
                 if not path.is_file():
@@ -77,25 +108,44 @@ def collect_files(root: Path, max_mb: float, skip_symlinks: bool):
                 size = path.stat().st_size
 
                 if size <= 0:
+                    skipped_empty += 1
                     continue
 
                 if size > max_bytes:
+                    skipped_large += 1
                     continue
 
                 files.append(path)
 
             except Exception:
+                skipped_unreadable += 1
                 continue
+
+        if time.time() - last_print >= 5:
+            print(
+                f"Scanning... dirs: {dirs_scanned:,} | "
+                f"files seen: {files_seen:,} | "
+                f"files kept: {len(files):,} | "
+                f"skipped large: {skipped_large:,} | "
+                f"unreadable: {skipped_unreadable:,}",
+                flush=True
+            )
+            last_print = time.time()
+
+    print()
+    print("File collection complete.")
+    print(f"Directories scanned: {dirs_scanned:,}")
+    print(f"Files seen: {files_seen:,}")
+    print(f"Files kept for duplicate analysis: {len(files):,}")
+    print(f"Skipped empty files: {skipped_empty:,}")
+    print(f"Skipped large files: {skipped_large:,}")
+    print(f"Skipped excluded/symlink files: {skipped_symlink_or_excluded:,}")
+    print(f"Skipped unreadable files: {skipped_unreadable:,}")
 
     return files
 
 
 def choose_keep_file(paths):
-    """
-    Default retention rule:
-    1. keep newest file
-    2. if tied, keep shortest path
-    """
     return sorted(paths, key=lambda p: (-p.stat().st_mtime, len(str(p))))[0]
 
 
@@ -108,7 +158,9 @@ def safe_quarantine_path(root: Path, original: Path, group_id: int) -> Path:
     final_target = target
 
     while final_target.exists():
-        final_target = target.with_name(f"{target.stem}__duplicate_{counter}{target.suffix}")
+        final_target = target.with_name(
+            f"{target.stem}__duplicate_{counter}{target.suffix}"
+        )
         counter += 1
 
     return final_target
@@ -139,11 +191,17 @@ def write_csv(rows, output_csv: Path):
 
 
 def scan_duplicates(root: Path, algorithm: str, max_mb: float, skip_symlinks: bool):
+    resolved_algorithm = resolve_hash_algorithm(algorithm)
+
     print(f"Scanning root: {root}")
     print("Mode: read-only scan first")
     print("No files will be moved unless you confirm quarantine later.")
+    print(f"Hash algorithm: {resolved_algorithm.upper()}")
 
     files = collect_files(root, max_mb=max_mb, skip_symlinks=skip_symlinks)
+
+    print()
+    print("Grouping files by exact file size...")
 
     by_size = defaultdict(list)
     for path in files:
@@ -152,21 +210,54 @@ def scan_duplicates(root: Path, algorithm: str, max_mb: float, skip_symlinks: bo
         except Exception:
             continue
 
+    candidate_groups = [
+        (size, same_size_files)
+        for size, same_size_files in by_size.items()
+        if len(same_size_files) >= 2
+    ]
+
+    total_candidate_files = sum(len(paths) for _, paths in candidate_groups)
+
+    print(f"Total size groups: {len(by_size):,}")
+    print(f"Candidate size groups with >=2 files: {len(candidate_groups):,}")
+    print(f"Candidate files requiring hashing: {total_candidate_files:,}")
+
     by_hash = defaultdict(list)
+    hash_errors = 0
+    hashed_files = 0
+    last_print = time.time()
 
-    for size, same_size_files in by_size.items():
-        if len(same_size_files) < 2:
-            continue
+    print()
+    print("Hashing candidate files...")
 
+    for group_idx, (size, same_size_files) in enumerate(candidate_groups, start=1):
         for path in same_size_files:
             try:
-                digest = compute_hash(path, algorithm)
+                digest = compute_hash(path, resolved_algorithm)
                 by_hash[(size, digest)].append(path)
+                hashed_files += 1
             except Exception as e:
-                print(f"Skipped unreadable file: {path} ({e})")
+                hash_errors += 1
+                print(f"Skipped unreadable/hash-failed file: {path} ({e})", flush=True)
+
+        if time.time() - last_print >= 5 or group_idx == len(candidate_groups):
+            pct_groups = (group_idx / len(candidate_groups) * 100) if candidate_groups else 100
+            pct_files = (hashed_files / total_candidate_files * 100) if total_candidate_files else 100
+
+            print(
+                f"Hashing progress: "
+                f"groups {group_idx:,}/{len(candidate_groups):,} ({pct_groups:.1f}%) | "
+                f"files hashed {hashed_files:,}/{total_candidate_files:,} ({pct_files:.1f}%) | "
+                f"errors: {hash_errors:,}",
+                flush=True
+            )
+            last_print = time.time()
 
     rows = []
     group_id = 1
+
+    print()
+    print("Building duplicate report...")
 
     for (size, digest), paths in by_hash.items():
         if len(paths) < 2:
@@ -186,17 +277,23 @@ def scan_duplicates(root: Path, algorithm: str, max_mb: float, skip_symlinks: bo
                 "keep_file": str(keep_file),
                 "candidate_file": str(path),
                 "quarantine_target": str(quarantine_target),
-                "hash_algorithm": algorithm.upper(),
+                "hash_algorithm": resolved_algorithm.upper(),
                 "content_hash": digest,
                 "size_bytes": size,
                 "size_mb": round(size / (1024 ** 2), 3),
                 "modified": datetime.fromtimestamp(stat.st_mtime).isoformat(timespec="seconds"),
-                "reason": f"same {algorithm.upper()} content hash",
+                "reason": f"same {resolved_algorithm.upper()} content hash",
             })
 
         group_id += 1
 
-    return files, rows
+    return files, rows, {
+        "candidate_size_groups": len(candidate_groups),
+        "candidate_files_hashed": hashed_files,
+        "hash_errors": hash_errors,
+        "total_candidate_files": total_candidate_files,
+        "hash_algorithm": resolved_algorithm,
+    }
 
 
 def quarantine_files(rows, manifest_csv: Path):
@@ -256,12 +353,44 @@ def main():
     )
 
     parser.add_argument("path", help="Root path to scan")
-    parser.add_argument("--out", default="duplicate_report.csv", help="CSV report output path")
-    parser.add_argument("--hash", choices=["blake3", "sha256"], default="blake3")
-    parser.add_argument("--max-mb", type=float, default=2000)
-    parser.add_argument("--follow-symlinks", action="store_true")
-    parser.add_argument("--quarantine", action="store_true", help="Ask whether to move recommended duplicates")
-    parser.add_argument("--manifest", default="quarantine_manifest.csv")
+
+    parser.add_argument(
+        "--out",
+        default="duplicate_report.csv",
+        help="CSV report output path"
+    )
+
+    parser.add_argument(
+        "--hash",
+        choices=["auto", "blake3", "sha256"],
+        default="auto",
+        help="Hash algorithm. Default: auto, preferring BLAKE3 if installed, otherwise SHA256."
+    )
+
+    parser.add_argument(
+        "--max-mb",
+        type=float,
+        default=20000,
+        help="Maximum file size in MB to include. Default: 20000 MB."
+    )
+
+    parser.add_argument(
+        "--follow-symlinks",
+        action="store_true",
+        help="Follow symlinks instead of skipping them."
+    )
+
+    parser.add_argument(
+        "--quarantine",
+        action="store_true",
+        help="Ask whether to move recommended duplicates."
+    )
+
+    parser.add_argument(
+        "--manifest",
+        default="quarantine_manifest.csv",
+        help="CSV manifest for quarantined files."
+    )
 
     args = parser.parse_args()
 
@@ -273,7 +402,7 @@ def main():
         print(f"Invalid path: {root}", file=sys.stderr)
         sys.exit(1)
 
-    files, rows = scan_duplicates(
+    files, rows, diagnostics = scan_duplicates(
         root=root,
         algorithm=args.hash,
         max_mb=args.max_mb,
@@ -286,10 +415,15 @@ def main():
     quarantine_count = sum(row["recommended_action"] == "QUARANTINE" for row in rows)
 
     print()
-    print(f"Files scanned: {len(files)}")
-    print(f"Duplicate groups found: {groups}")
-    print(f"Rows written: {len(rows)}")
-    print(f"Files recommended for quarantine: {quarantine_count}")
+    print("Scan complete.")
+    print(f"Hash algorithm used: {diagnostics['hash_algorithm'].upper()}")
+    print(f"Files scanned: {len(files):,}")
+    print(f"Candidate size groups: {diagnostics['candidate_size_groups']:,}")
+    print(f"Candidate files hashed: {diagnostics['candidate_files_hashed']:,}")
+    print(f"Hash/read errors: {diagnostics['hash_errors']:,}")
+    print(f"Duplicate groups found: {groups:,}")
+    print(f"Rows written: {len(rows):,}")
+    print(f"Files recommended for quarantine: {quarantine_count:,}")
     print(f"CSV report: {output_csv}")
 
     if args.quarantine:
