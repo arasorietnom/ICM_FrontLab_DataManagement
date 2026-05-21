@@ -197,8 +197,8 @@ def main():
 
     parser.add_argument(
         "--out-dir",
-        default="reports/owner_duplicate_analysis",
-        help="Output directory for owner summaries"
+        default=None,
+        help="Output directory. Default: ./user_reports"
     )
 
     parser.add_argument(
