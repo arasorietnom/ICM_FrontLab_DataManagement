@@ -1,5 +1,9 @@
 #!/usr/bin/env python3
 
+
+# commandline
+# python duplicate_owner_summary.py reports/duplicate_report_YYYYMMDD_HHMMSS.csv --per-owner-files
+
 import argparse
 import csv
 from collections import defaultdict
